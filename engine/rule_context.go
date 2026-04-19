@@ -555,9 +555,10 @@ func (ctx *DefaultRuleContext) TellCollect(msg types.RuleMsg, callback func(msgL
 		ctx.observer.registerNodeDoneEvent(selfNodeId, lcaNodeId, func(inMsgList []types.WrapperMsg) {
 			callback(inMsgList)
 		})
-		if ctx.from != nil {
-			ctx.observer.executedNode(ctx.from.GetNodeId().Id)
-		}
+		// 注意：不再调用 executedNode(fromId)
+		// LCA节点应该通过 childDoneWithoutCallback 流程在 waitingCount 归零时被标记为完成
+		// 而不是在这里立即标记。否则当 fork 节点直接连接到 join 节点时，
+		// fork 会在所有子节点完成前就被标记为完成，导致 join 过早触发回调。
 		return true
 	}
 }
@@ -749,7 +750,7 @@ func (ctx *DefaultRuleContext) DoOnEnd(msg types.RuleMsg, err error, relationTyp
 	// 如果配置了结束节点，只有结束节点才能触发回调；如果没有配置结束节点，所有节点都可以触发
 	isEndNode := ctx.self != nil && ctx.self.Type() == types.NodeTypeEnd
 	if configOnEnd != nil || contextOnEnd != nil {
-		ctx.SubmitTask(func() {
+		if relationType == types.Stream {
 			// 是否触发回调
 			shouldTrigger := ctx.ruleChainCtx == nil || !ctx.HasEndNode() || isEndNode || (ctx.config.OnEndWithFailure && relationType == types.Failure)
 			//全局回调
@@ -761,8 +762,26 @@ func (ctx *DefaultRuleContext) DoOnEnd(msg types.RuleMsg, err error, relationTyp
 			if contextOnEnd != nil && shouldTrigger {
 				contextOnEnd(ctx, msgToUse, err, relationType)
 			}
-			ctx.childDone()
-		})
+			if msg.GetMetadata().Has(types.KeyStreamStart) {
+				ctx.childDone()
+			}
+		} else {
+			ctx.SubmitTask(func() {
+				// 是否触发回调
+				shouldTrigger := ctx.ruleChainCtx == nil || !ctx.HasEndNode() || isEndNode || (ctx.config.OnEndWithFailure && relationType == types.Failure)
+				//全局回调
+				//通过`Config.OnEnd`设置
+				if configOnEnd != nil && shouldTrigger {
+					configOnEnd(ctx, msgToUse, err, relationType)
+				}
+				// types.withOnEnd 设置的回调
+				if contextOnEnd != nil && shouldTrigger {
+					contextOnEnd(ctx, msgToUse, err, relationType)
+				}
+				ctx.childDone()
+			})
+		}
+
 	} else {
 		ctx.childDone()
 	}
@@ -895,8 +914,10 @@ func (ctx *DefaultRuleContext) IsDebugMode() bool {
 }
 
 // 增加一个待执行子节点
-func (ctx *DefaultRuleContext) childReady() {
-	atomic.AddInt32(&ctx.waitingCount, 1)
+func (ctx *DefaultRuleContext) childReady(msg types.RuleMsg, relationType string) {
+	if relationType != types.Stream || (relationType == types.Stream && msg.GetMetadata().Has(types.KeyStreamStart)) {
+		atomic.AddInt32(&ctx.waitingCount, 1)
+	}
 }
 
 // 减少一个待执行子节点
@@ -904,7 +925,6 @@ func (ctx *DefaultRuleContext) childReady() {
 func (ctx *DefaultRuleContext) childDone() {
 	if atomic.AddInt32(&ctx.waitingCount, -1) <= 0 {
 		if atomic.CompareAndSwapInt32(&ctx.onAllNodeCompletedDone, 0, 1) {
-
 			// 在进行任何异步操作前捕获需要的值，避免并发问题
 			parentRuleCtx := ctx.parentRuleCtx
 			selfId := ctx.GetSelfId()
@@ -943,8 +963,7 @@ func (ctx *DefaultRuleContext) childDone() {
 // - 配合 TellCollect 方法使用，查询该节点的父节点共同祖先是否所有分支到当前聚合节点都已经执行完成
 // - 用于多分支汇聚场景的状态跟踪，避免过早触发完成事件
 func (ctx *DefaultRuleContext) childDoneWithoutCallback() {
-	newCount := atomic.AddInt32(&ctx.waitingCount, -1)
-	if newCount <= 0 {
+	if atomic.AddInt32(&ctx.waitingCount, -1) <= 0 {
 		//if atomic.CompareAndSwapInt32(&ctx.onAllNodeCompletedDone, 0, 1) {
 
 		// 在进行任何异步操作前捕获需要的值，避免并发问题
@@ -987,9 +1006,13 @@ func (ctx *DefaultRuleContext) tellSelf(msg types.RuleMsg, err error, relationTy
 		// 异步执行需要拷贝确保线程安全
 		// 注意：不能简单根据节点类型优化，因为其他并发分支可能修改消息
 		msgCopy := msg.Copy()
-		ctx.SubmitTask(func() {
+		if relationType == types.Stream {
 			ctx.tellNext(msgCopy, ctx.self, relationType)
-		})
+		} else {
+			ctx.SubmitTask(func() {
+				ctx.tellNext(msgCopy, ctx.self, relationType)
+			})
+		}
 	} else {
 		ctx.DoOnEnd(msg, err, relationType)
 	}
@@ -1032,7 +1055,7 @@ func (ctx *DefaultRuleContext) tellOrElse(msg types.RuleMsg, err error, defaultR
 					for _, item := range nodes {
 						tmp := item
 						//增加一个待执行的子节点
-						ctx.childReady()
+						ctx.childReady(msg, relationType)
 
 						var msgToPass types.RuleMsg
 						if needsCopy {
@@ -1044,13 +1067,18 @@ func (ctx *DefaultRuleContext) tellOrElse(msg types.RuleMsg, err error, defaultR
 						}
 
 						//通知执行子节点
-						ctx.SubmitTask(func() {
+						if relationType == types.Stream {
+							//为了保证流块的顺序
 							ctx.tellNext(msgToPass, tmp, relationType)
-						})
+						} else {
+							ctx.SubmitTask(func() {
+								ctx.tellNext(msgToPass, tmp, relationType)
+							})
+						}
 					}
 				} else {
 					//调用DoOnEnd 会调用 childDone()对waitingCount会减1，所以childReady和childDone成对出现
-					ctx.childReady()
+					ctx.childReady(msg, relationType)
 					//找不到子节点，则执行结束回调
 					ctx.DoOnEnd(msg, err, relationType)
 				}
